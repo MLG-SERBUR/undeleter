@@ -27,7 +27,7 @@ webhook_url: "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKE
 # Requires Manage Webhooks permission
 # If true: Bot automatically creates webhooks as needed, ignores webhook_url and channel_webhooks
 # If false: You must manually configure webhook_url and/or channel_webhooks below
-auto_create_webhooks: false
+auto_create_webhooks: true
 
 # Default webhook URL (used when auto_create_webhooks is false)
 # All undeleted messages will go to this channel
@@ -49,26 +49,22 @@ trash_emoji: "🗑️"
 # Bot activity status (what the bot is "doing" in Discord)
 # Type: playing, streaming, listening, watching, custom
 # Set both to blank ("" or empty) to skip setting activity/presence
-activity_type: "watching"
-activity_name: "for deleted messages"
+activity_type: ""
+activity_name: ""
 
 # Message cache settings
 # Maximum number of messages to keep in memory per channel
 # Reduce this for lower RAM usage (e.g., 100 for minimal RAM)
-cache_max_messages: 500
+cache_max_messages: 100
 
 # Persist messages to file (enable if bot restarts frequently)
-cache_persist: false
+cache_persist: true
 
 # File to store persisted messages (only used if cache_persist is true)
 cache_file: "messages.dat"
 
 # Skip undeleting messages from privileged users
 # DEFAULT: Users with manage_messages permission are skipped
-# This includes both:
-#   - When a mod/admin deletes their own message
-#   - When a mod/admin deletes another user's message (detected via permissions)
-#
 # Options (comma-separated):
 #   administrator, admin, manage_messages, manage msg, kick, ban, manage_guild, manage server
 skip_permissions: "manage_messages"
