@@ -219,10 +219,15 @@ channel_webhooks:
 **Option 3: Auto-create webhooks (recommended)**
 With `Manage Webhooks` permission, the bot can automatically create webhooks for each channel as needed:
 ```yaml
-webhook_url: "https://discord.com/api/webhooks/DEFAULT_ID/DEFAULT_TOKEN"  # Optional fallback
 auto_create_webhooks: true  # Bot will create webhooks automatically
+# Note: When auto_create_webhooks is true, webhook_url and channel_webhooks are IGNORED
 ```
-**Note:** You need to create a separate webhook in Discord for each channel for Options 2 & 3.
+The bot will:
+- Automatically create a webhook in each channel when the first message is deleted there
+- Store the webhook URL in memory (not persisted to file)
+- Use that webhook for all future deletions in that channel
+
+**Note:** You need to create a separate webhook in Discord for each channel for Options 2 & 3, OR use Option 1 (single channel).
 
 ### Slash Commands
 

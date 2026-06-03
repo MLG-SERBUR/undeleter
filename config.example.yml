@@ -25,10 +25,16 @@ webhook_url: "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKE
 
 # Auto-create webhooks for channels that don't have one
 # Requires Manage Webhooks permission
-# If false, you must manually configure channel_webhooks below
+# If true: Bot automatically creates webhooks as needed, ignores webhook_url and channel_webhooks
+# If false: You must manually configure webhook_url and/or channel_webhooks below
 auto_create_webhooks: false
 
-# Per-channel webhooks (optional)
+# Default webhook URL (used when auto_create_webhooks is false)
+# All undeleted messages will go to this channel
+# Format: https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
+webhook_url: "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+
+# Per-channel webhooks (used when auto_create_webhooks is false)
 # Use this if you want messages undeleted to their original channel
 # Each webhook must be in the same channel as the channel_id
 # Format: CHANNEL_ID: WEBHOOK_URL

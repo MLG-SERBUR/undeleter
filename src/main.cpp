@@ -783,26 +783,37 @@ void create_webhook_for_channel(snowflake channel_id, snowflake guild_id, const 
 
 /**
  * Get or create a webhook for a channel
- * If auto_create_webhooks is enabled and no webhook exists, creates one
+ * If auto_create_webhooks is enabled, ignores config webhooks and creates one automatically
  */
 void get_or_create_webhook(snowflake channel_id, snowflake guild_id, 
                           const std::function<void(const std::string&)>& callback) {
-    // Check if we already have a webhook for this channel
-    std::string existing_url = get_webhook_url(channel_id);
-    if (!existing_url.empty()) {
-        callback(existing_url);
-        return;
-    }
-    
-    // If auto-create is enabled, create a webhook
+    // If auto_create_webhooks is enabled, always create a new webhook
+    // and ignore webhook_url and channel_webhooks config
     if (config.auto_create_webhooks && guild_id != 0) {
+        // Check if we already created one for this channel (stored in channel_webhooks map)
+        auto it = config.channel_webhooks.find(channel_id);
+        if (it != config.channel_webhooks.end()) {
+            callback(it->second);
+            return;
+        }
+        
+        // Create a new webhook
         create_webhook_for_channel(channel_id, guild_id, 
             [callback, channel_id](const webhook& wh) {
                 std::string webhook_url = "https://discord.com/api/webhooks/" + 
                                           std::to_string(wh.id) + "/" + wh.token;
+                // Store in memory (not persisted)
+                config.channel_webhooks[channel_id] = webhook_url;
                 callback(webhook_url);
             }
         );
+        return;
+    }
+    
+    // Auto-create is disabled, use configured webhooks
+    std::string existing_url = get_webhook_url(channel_id);
+    if (!existing_url.empty()) {
+        callback(existing_url);
         return;
     }
     
