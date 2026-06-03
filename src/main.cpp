@@ -26,13 +26,15 @@
 #include <ctime>
 #include <algorithm>
 #include <csignal>
+#include <functional>
+#include <cctype>
 
 using namespace dpp;
 
 // Configuration structure
 struct Config {
     std::string bot_token;
-    std::string webhook_url;
+    std::string webhook_url;  // Default webhook URL
     std::string trash_emoji = "🗑️";
     int max_messages_per_channel = 500;
     bool persist_to_file = false;
@@ -43,6 +45,15 @@ struct Config {
     std::vector<snowflake> guild_blacklist;
     std::vector<snowflake> channel_blacklist;
     std::vector<snowflake> channel_whitelist;
+    // Per-channel webhooks: channel_id -> webhook_url
+    std::unordered_map<snowflake, std::string> channel_webhooks;
+    // Skip undeleting messages from users with these role IDs
+    std::vector<snowflake> skip_role_ids;
+    // Skip undeleting if user has any of these permissions
+    // Default: skip users with manage_messages or administrator
+    permission skip_permissions = p_manage_messages;
+    // Auto-create webhooks for channels that don't have one
+    bool auto_create_webhooks = false;
 };
 
 // Cached message structure
@@ -54,6 +65,7 @@ struct CachedMessage {
     std::string author_name;
     std::string content;
     time_t timestamp;
+    bool skip_undelete = false;  // True if this message should not be undeleted (e.g., from admin)
 };
 
 // Global configuration
@@ -65,6 +77,10 @@ std::mutex cache_mutex;
 
 // Get the cluster for webhook execution
 cluster* bot_cluster = nullptr;
+
+// Undeleter toggle state (not persisted, in-memory only)
+bool undelete_enabled = true;
+std::mutex undelete_mutex;
 
 /**
  * Split a string by delimiter
@@ -189,6 +205,22 @@ bool load_config(const std::string& filename) {
             continue;
         }
         
+        // Handle channel_webhooks map (special case)
+        if (current_section == "channel_webhooks" && !line.empty() && line[0] != '#') {
+            size_t colon_pos = line.find(':');
+            if (colon_pos != std::string::npos) {
+                std::string channel_id_str = trim(line.substr(0, colon_pos));
+                std::string webhook_url = trim(unquote(line.substr(colon_pos + 1)));
+                try {
+                    snowflake channel_id = std::stoull(channel_id_str);
+                    config.channel_webhooks[channel_id] = webhook_url;
+                } catch (...) {
+                    std::cerr << "Invalid channel ID in channel_webhooks: " << channel_id_str << std::endl;
+                }
+            }
+            continue;
+        }
+        
         // Parse key-value pairs
         size_t colon_pos = line.find(':');
         if (colon_pos == std::string::npos) {
@@ -240,6 +272,47 @@ bool load_config(const std::string& filename) {
             config.activity_type = value;
         } else if (full_key == "activity_name") {
             config.activity_name = value;
+        } else if (key == "channel_webhooks") {
+            // Parse channel_id: webhook_url pairs
+            // Format: "channel_id: webhook_url" on each line
+            // Skip for now, would need YAML map parsing
+        } else if (key == "auto_create_webhooks") {
+            config.auto_create_webhooks = (value == "true" || value == "1" || value == "yes");
+        } else if (key == "skip_role_ids") {
+            auto ids = parse_snowflake_list(value);
+            config.skip_role_ids.insert(config.skip_role_ids.end(), ids.begin(), ids.end());
+        } else if (key == "skip_permissions") {
+            // Parse permission flags - supports multiple comma-separated values
+            // Common: administrator, manage_messages, kick_members, ban_members, manage_guild
+            std::string lower_value = value;
+            std::transform(lower_value.begin(), lower_value.end(), lower_value.begin(), ::tolower);
+            
+            permission perms = p_none;
+            
+            if (lower_value.find("administrator") != std::string::npos || 
+                lower_value.find("admin") != std::string::npos) {
+                perms = perms | p_administrator;
+            }
+            if (lower_value.find("manage_messages") != std::string::npos ||
+                lower_value.find("manage msg") != std::string::npos) {
+                perms = perms | p_manage_messages;
+            }
+            if (lower_value.find("kick_members") != std::string::npos ||
+                lower_value.find("kick") != std::string::npos) {
+                perms = perms | p_kick_members;
+            }
+            if (lower_value.find("ban_members") != std::string::npos ||
+                lower_value.find("ban") != std::string::npos) {
+                perms = perms | p_ban_members;
+            }
+            if (lower_value.find("manage_guild") != std::string::npos ||
+                lower_value.find("manage server") != std::string::npos) {
+                perms = perms | p_manage_guild;
+            }
+            
+            if (perms != p_none) {
+                config.skip_permissions = perms;
+            }
         } else if (full_key == "guild_blacklist" || key == "guild_blacklist") {
             auto ids = parse_snowflake_list(value);
             config.guild_blacklist.insert(config.guild_blacklist.end(), ids.begin(), ids.end());
@@ -283,6 +356,17 @@ void load_messages_from_file() {
     }
     
     try {
+        // Check file version (first byte)
+        uint8_t version = 0;
+        if (!file.read(reinterpret_cast<char*>(&version), sizeof(version))) {
+            std::cerr << "Error reading message cache: invalid format" << std::endl;
+            return;
+        }
+        
+        // For now, version 0 is the old format, version 1 is new format with skip_undelete
+        // We'll just load what we can
+        file.seekg(0, std::ios::beg); // Rewind
+        
         size_t channel_count;
         if (!file.read(reinterpret_cast<char*>(&channel_count), sizeof(channel_count))) {
             std::cerr << "Error reading message cache: invalid format" << std::endl;
@@ -311,6 +395,14 @@ void load_messages_from_file() {
                 if (!file.read(reinterpret_cast<char*>(&msg.guild_id), sizeof(msg.guild_id))) break;
                 if (!file.read(reinterpret_cast<char*>(&msg.author_id), sizeof(msg.author_id))) break;
                 if (!file.read(reinterpret_cast<char*>(&msg.timestamp), sizeof(msg.timestamp))) break;
+                
+                // Try to read skip_undelete flag (new format)
+                if (!file.read(reinterpret_cast<char*>(&msg.skip_undelete), sizeof(msg.skip_undelete))) {
+                    msg.skip_undelete = false; // Default to false for old files
+                    file.clear(); // Clear error flag
+                    // Rewind a bit and try to continue
+                    file.seekg(-static_cast<std::streamoff>(sizeof(msg.timestamp)), std::ios::cur);
+                }
                 
                 uint32_t author_name_len;
                 if (!file.read(reinterpret_cast<char*>(&author_name_len), sizeof(author_name_len))) break;
@@ -349,6 +441,10 @@ void save_messages_to_file() {
     }
     
     try {
+        // Write version byte (1 = current format with skip_undelete)
+        uint8_t version = 1;
+        file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        
         size_t channel_count = message_cache.size();
         file.write(reinterpret_cast<const char*>(&channel_count), sizeof(channel_count));
         
@@ -366,6 +462,7 @@ void save_messages_to_file() {
                 file.write(reinterpret_cast<const char*>(&msg.guild_id), sizeof(msg.guild_id));
                 file.write(reinterpret_cast<const char*>(&msg.author_id), sizeof(msg.author_id));
                 file.write(reinterpret_cast<const char*>(&msg.timestamp), sizeof(msg.timestamp));
+                file.write(reinterpret_cast<const char*>(&msg.skip_undelete), sizeof(msg.skip_undelete));
                 
                 uint32_t author_name_len = static_cast<uint32_t>(msg.author_name.size());
                 file.write(reinterpret_cast<const char*>(&author_name_len), sizeof(author_name_len));
@@ -418,14 +515,81 @@ bool is_channel_allowed(snowflake channel_id, snowflake guild_id) {
 }
 
 /**
+ * Check if a guild member has manage_messages permission
+ */
+bool has_manage_messages(const message_create_t& event) {
+    // Can't check permissions in DMs
+    if (event.msg.guild_id == 0) {
+        return false;
+    }
+    
+    // Need member info
+    if (!event.msg.member) {
+        return false;
+    }
+    
+    // Check for manage_messages permission
+    if ((event.msg.member.permissions & p_manage_messages) != p_none) {
+        return true;
+    }
+    
+    // Check for administrator (implies all permissions)
+    if ((event.msg.member.permissions & p_administrator) != p_none) {
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Check if a user should be skipped (e.g., admin, moderator)
+ */
+bool should_skip_user(const message_create_t& event) {
+    // Always skip bots
+    if (event.msg.author.is_bot()) {
+        return true;
+    }
+    
+    // If it's a DM, don't skip
+    if (event.msg.guild_id == 0) {
+        return false;
+    }
+    
+    // If no member info (shouldn't happen in guild), don't skip
+    if (!event.msg.member) {
+        return false;
+    }
+    
+    // Check if user has any skip roles
+    if (!config.skip_role_ids.empty()) {
+        for (auto role_id : config.skip_role_ids) {
+            if (std::find(event.msg.member.roles.begin(), event.msg.member.roles.end(), role_id)
+                != event.msg.member.roles.end()) {
+                return true;
+            }
+        }
+    }
+    
+    // Check if user has skip permissions
+    // Note: p_administrator implies all other permissions, so we check it specifically
+    if (config.skip_permissions != p_none) {
+        if ((event.msg.member.permissions & config.skip_permissions) != p_none) {
+            return true;
+        }
+        // Also check for administrator if specific permission is requested
+        if (config.skip_permissions == p_administrator && 
+            (event.msg.member.permissions & p_administrator) != p_none) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
  * Cache a message
  */
 void cache_message(const message_create_t& event) {
-    // Ignore messages from bots
-    if (event.msg.author.is_bot()) {
-        return;
-    }
-    
     // Ignore empty messages
     if (event.msg.content.empty()) {
         return;
@@ -436,6 +600,9 @@ void cache_message(const message_create_t& event) {
         return;
     }
     
+    // Check if we should skip this user
+    bool skip = should_skip_user(event);
+    
     CachedMessage msg;
     msg.id = event.msg.id;
     msg.channel_id = event.msg.channel_id;
@@ -444,6 +611,7 @@ void cache_message(const message_create_t& event) {
     msg.author_name = event.msg.author.username;
     msg.content = event.msg.content;
     msg.timestamp = time(nullptr);
+    msg.skip_undelete = skip;
     
     std::lock_guard<std::mutex> lock(cache_mutex);
     
@@ -510,45 +678,37 @@ void remove_cached_message(snowflake message_id, snowflake channel_id) {
 }
 
 /**
- * Repost a deleted message via webhook
+ * Extract webhook ID and token from URL
  */
-void repost_message(const CachedMessage& msg) {
-    if (config.webhook_url.empty()) {
-        std::cerr << "No webhook URL configured, cannot repost message" << std::endl;
-        return;
-    }
-    
-    // Prepare the message content - just the original message
-    std::string content = msg.content;
-    
-    // Create webhook message with trash emoji + username as the webhook username
-    webhook_message wm;
-    wm.content = content;
-    wm.username = config.trash_emoji + msg.author_name;
-    
-    // Extract webhook ID and token from URL
-    // URL format: https://discord.com/api/webhooks/ID/TOKEN
-    std::string url = config.webhook_url;
+std::pair<std::string, std::string> parse_webhook_url(const std::string& url) {
     size_t api_pos = url.find("/api/webhooks/");
     if (api_pos == std::string::npos) {
-        std::cerr << "Invalid webhook URL format: " << url << std::endl;
-        return;
+        return {"", ""};
     }
     
     std::string rest = url.substr(api_pos + 15); // Length of "/api/webhooks/"
     size_t slash_pos = rest.find('/');
     if (slash_pos == std::string::npos) {
-        std::cerr << "Invalid webhook URL format: " << url << std::endl;
-        return;
+        return {"", ""};
     }
     
-    std::string webhook_id_str = rest.substr(0, slash_pos);
-    std::string token = rest.substr(slash_pos + 1);
+    return {rest.substr(0, slash_pos), rest.substr(slash_pos + 1)};
+}
+
+/**
+ * Execute a webhook message
+ */
+void execute_webhook(const std::string& webhook_url, const webhook_message& wm) {
+    auto [webhook_id_str, token] = parse_webhook_url(webhook_url);
+    
+    if (webhook_id_str.empty() || token.empty()) {
+        std::cerr << "Invalid webhook URL format: " << webhook_url << std::endl;
+        return;
+    }
     
     try {
         snowflake webhook_id = std::stoull(webhook_id_str);
         
-        // Send the webhook message
         bot_cluster->execute_webhook(webhook_id, token, true, wm,
             [](const http_request_completion_t& completion) {
                 if (completion.status != http_status_code::h_204 && 
@@ -568,9 +728,270 @@ void repost_message(const CachedMessage& msg) {
 }
 
 /**
+ * Get the webhook URL for a specific channel
+ * Returns the channel-specific webhook if configured, otherwise the default
+ */
+std::string get_webhook_url(snowflake channel_id) {
+    // Check for channel-specific webhook
+    auto it = config.channel_webhooks.find(channel_id);
+    if (it != config.channel_webhooks.end()) {
+        return it->second;
+    }
+    
+    // Return default webhook
+    return config.webhook_url;
+}
+
+/**
+ * Create a webhook for a channel
+ * Requires Manage Webhooks permission
+ */
+void create_webhook_for_channel(snowflake channel_id, snowflake guild_id, const std::function<void(const webhook)&) &callback) {
+    if (guild_id == 0) {
+        // Can't create webhooks in DMs
+        return;
+    }
+    
+    // Create webhook with a name
+    bot_cluster->current_user_create_webhook(guild_id, channel_id, "Undeleter", "",
+        [channel_id, callback](const confirmation_callback_t& response) {
+            if (response.is_error()) {
+                std::cerr << "Failed to create webhook for channel " << channel_id 
+                          << ": " << response.get_error().message << std::endl;
+                return;
+            }
+            
+            // The response contains the webhook object
+            webhook wh = response.get<webhook>();
+            
+            // Store the webhook URL
+            std::string webhook_url = "https://discord.com/api/webhooks/" + 
+                                      std::to_string(wh.id) + "/" + wh.token;
+            
+            // Store in config
+            config.channel_webhooks[channel_id] = webhook_url;
+            
+            std::cout << "Created webhook for channel " << channel_id 
+                      << ": " << wh.id << std::endl;
+            
+            if (callback) {
+                callback(wh);
+            }
+        }
+    );
+}
+
+/**
+ * Get or create a webhook for a channel
+ * If auto_create_webhooks is enabled and no webhook exists, creates one
+ */
+void get_or_create_webhook(snowflake channel_id, snowflake guild_id, 
+                          const std::function<void(const std::string&)>& callback) {
+    // Check if we already have a webhook for this channel
+    std::string existing_url = get_webhook_url(channel_id);
+    if (!existing_url.empty()) {
+        callback(existing_url);
+        return;
+    }
+    
+    // If auto-create is enabled, create a webhook
+    if (config.auto_create_webhooks && guild_id != 0) {
+        create_webhook_for_channel(channel_id, guild_id, 
+            [callback, channel_id](const webhook& wh) {
+                std::string webhook_url = "https://discord.com/api/webhooks/" + 
+                                          std::to_string(wh.id) + "/" + wh.token;
+                callback(webhook_url);
+            }
+        );
+        return;
+    }
+    
+    // No webhook available
+    callback("");
+}
+
+/**
+ * Repost a deleted message via webhook
+ */
+void repost_message(const CachedMessage& msg) {
+    // Check if undeleter is enabled
+    {
+        std::lock_guard<std::mutex> lock(undelete_mutex);
+        if (!undelete_enabled) {
+            std::cout << "Undeleter is disabled, skipping repost for message " 
+                      << msg.id << " from " << msg.author_name << std::endl;
+            return;
+        }
+    }
+    
+    // Skip if this message should not be undeleted (e.g., from admin/mod)
+    if (msg.skip_undelete) {
+        std::cout << "Skipping undelete for privileged user message from " 
+                  << msg.author_name << " (has manage messages permission)" << std::endl;
+        return;
+    }
+    
+    // Get or create webhook for this channel
+    get_or_create_webhook(msg.channel_id, msg.guild_id, 
+        [msg](const std::string& webhook_url) {
+            if (webhook_url.empty()) {
+                std::cerr << "No webhook URL configured/available for channel " 
+                          << msg.channel_id << ", cannot repost message" << std::endl;
+                return;
+            }
+            
+            // Prepare the message content - just the original message
+            std::string content = msg.content;
+            
+            // Create webhook message with trash emoji + username as the webhook username
+            webhook_message wm;
+            wm.content = content;
+            wm.username = config.trash_emoji + msg.author_name;
+            
+            // Execute the webhook
+            execute_webhook(webhook_url, wm);
+        }
+    );
+}
+
+/**
+ * Check if a user has manage_messages permission from a message
+ */
+bool user_has_manage_messages(const message_create_t& event) {
+    return has_manage_messages(event);
+}
+
+/**
+ * Check if a user has manage_messages from an interaction
+ */
+bool user_has_manage_messages(const interaction_create_t& event) {
+    // Check if this is a guild interaction
+    if (event.command.guild_id == 0) {
+        return false;
+    }
+    
+    // Get the member
+    if (event.command.member.permissions & p_manage_messages) {
+        return true;
+    }
+    if (event.command.member.permissions & p_administrator) {
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Handle slash command for toggling undeleter
+ */
+void on_interaction_create(const interaction_create_t& event) {
+    if (event.command.name == "undelete") {
+        // Check permissions
+        if (!user_has_manage_messages(event)) {
+            // Respond with error (ephemeral)
+            interaction_response resp;
+            resp.type = ir_channel_message_with_source;
+            resp.content = "❌ You do not have permission to use this command. (Require Manage Messages permission)";
+            resp.flags = m_ephemeral;
+            event.from->interaction_response_create(event.command.id, event.command.token, resp);
+            return;
+        }
+        
+        // Handle subcommands - check options
+        std::string subcommand = "status"; // default
+        for (const auto& opt : event.command.options) {
+            if (opt.name == "toggle" || opt.name == "off") {
+                subcommand = "off";
+                break;
+            } else if (opt.name == "on") {
+                subcommand = "on";
+                break;
+            } else if (opt.name == "status") {
+                subcommand = "status";
+                break;
+            }
+        }
+        
+        if (subcommand == "toggle" || subcommand == "off") {
+            std::lock_guard<std::mutex> lock(undelete_mutex);
+            undelete_enabled = false;
+            
+            interaction_response resp;
+            resp.type = ir_channel_message_with_source;
+            resp.content = "✅ Undeleter is now **DISABLED**. Deleted messages will not be reposted.";
+            resp.flags = m_ephemeral;
+            event.from->interaction_response_create(event.command.id, event.command.token, resp);
+        } else if (subcommand == "on") {
+            std::lock_guard<std::mutex> lock(undelete_mutex);
+            undelete_enabled = true;
+            
+            interaction_response resp;
+            resp.type = ir_channel_message_with_source;
+            resp.content = "✅ Undeleter is now **ENABLED**. Deleted messages will be reposted.";
+            resp.flags = m_ephemeral;
+            event.from->interaction_response_create(event.command.id, event.command.token, resp);
+        } else {
+            // status command
+            interaction_response resp;
+            resp.type = ir_channel_message_with_source;
+            resp.content = "Undeleter is currently **" + std::string(undelete_enabled ? "ENABLED" : "DISABLED") + "**.\n"
+                      "Use `/undelete toggle` or `/undelete off` to disable, `/undelete on` to enable.";
+            resp.flags = m_ephemeral;
+            event.from->interaction_response_create(event.command.id, event.command.token, resp);
+        }
+    }
+}
+
+/**
+ * Register slash commands
+ */
+void register_commands(cluster& bot) {
+    // Create slash command with subcommands
+    command cmd;
+    cmd.name = "undelete";
+    cmd.description = "Manage the undeleter bot";
+    cmd.type = ct_chat_input;
+    
+    // Add subcommands
+    command_option toggle_opt;
+    toggle_opt.name = "toggle";
+    toggle_opt.description = "Toggle the undeleter on/off";
+    toggle_opt.type = cot_sub_command;
+    cmd.options.push_back(toggle_opt);
+    
+    command_option on_opt;
+    on_opt.name = "on";
+    on_opt.description = "Enable the undeleter";
+    on_opt.type = cot_sub_command;
+    cmd.options.push_back(on_opt);
+    
+    command_option off_opt;
+    off_opt.name = "off";
+    off_opt.description = "Disable the undeleter";
+    off_opt.type = cot_sub_command;
+    cmd.options.push_back(off_opt);
+    
+    command_option status_opt;
+    status_opt.name = "status";
+    status_opt.description = "Check the undeleter status";
+    status_opt.type = cot_sub_command;
+    cmd.options.push_back(status_opt);
+    
+    // Register the command globally
+    bot.current_user_edit('', [&bot, cmd](const confirmation_callback_t& response) {
+        if (response.is_error()) {
+            std::cerr << "Failed to register commands: " << response.get_error().message << std::endl;
+        } else {
+            std::cout << "Slash commands registered successfully" << std::endl;
+        }
+    }, cmd);
+}
+
+/**
  * Handle message creation
  */
 void on_message_create(const message_create_t& event) {
+    // Cache the message
     cache_message(event);
 }
 
@@ -627,22 +1048,32 @@ void on_ready(const ready_t& event) {
               << "#" << event.my_user.discriminator << " (ID: " 
               << event.my_user.id << ")" << std::endl;
     
-    // Set bot activity
-    presence_activity_type activity_type = presence_activity_type::pa_playing;
-    if (config.activity_type == "watching") {
-        activity_type = presence_activity_type::pa_watching;
-    } else if (config.activity_type == "listening") {
-        activity_type = presence_activity_type::pa_listening;
-    } else if (config.activity_type == "streaming") {
-        activity_type = presence_activity_type::pa_streaming;
-    } else if (config.activity_type == "custom") {
-        activity_type = presence_activity_type::pa_custom;
-    }
+    // Register slash commands
+    register_commands(*event.from);
     
-    event.from->set_presence({
-        {activity_type, config.activity_name},
-        presence_status::ps_online
-    });
+    // Set bot activity only if activity_type and activity_name are configured
+    if (!config.activity_type.empty() && !config.activity_name.empty()) {
+        presence_activity_type activity_type = presence_activity_type::pa_playing;
+        if (config.activity_type == "watching") {
+            activity_type = presence_activity_type::pa_watching;
+        } else if (config.activity_type == "listening") {
+            activity_type = presence_activity_type::pa_listening;
+        } else if (config.activity_type == "streaming") {
+            activity_type = presence_activity_type::pa_streaming;
+        } else if (config.activity_type == "custom") {
+            activity_type = presence_activity_type::pa_custom;
+        }
+        
+        event.from->set_presence({
+            {activity_type, config.activity_name},
+            presence_status::ps_online
+        });
+    } else {
+        // Just set online status without an activity
+        event.from->set_presence({
+            presence_status::ps_online
+        });
+    }
 }
 
 /**
@@ -697,6 +1128,7 @@ int main(int argc, char** argv) {
     bot_cluster->on_message_create = on_message_create;
     bot_cluster->on_message_delete = on_message_delete;
     bot_cluster->on_message_delete_bulk = on_message_delete_bulk;
+    bot_cluster->on_interaction_create = on_interaction_create;
     
     // Log in
     try {

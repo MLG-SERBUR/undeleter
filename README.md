@@ -7,9 +7,14 @@ A lightweight Discord bot written in C++ that reposts deleted messages via webho
 - **C++ Implementation**: Minimal RAM usage, efficient performance
 - **Message Caching**: Caches messages in memory (configurable limit)
 - **Webhook Reposting**: Uses Discord webhooks to repost deleted messages
+  - Single webhook: All undeleted messages go to one channel
+  - Per-channel webhooks: Messages undeleted to their original channel (requires webhook per channel)
+  - **Auto-create webhooks**: With `Manage Webhooks` permission, bot can automatically create webhooks for each channel
 - **File Persistence**: Optional message persistence to file for survival across restarts
-- **Minimal Permissions**: Only requires View Channel and Send Messages permissions
+- **Minimal Permissions**: Only requires View Channel and Send Messages permissions (Manage Webhooks only needed for auto-creation)
 - **Channel Filtering**: Blacklist/whitelist channels and guilds
+- **Privileged User Filtering**: Skip undeleting messages from users with Manage Messages or other permissions
+- **Slash Commands**: Temporary disable/enable via `/undelete toggle` with ephemeral responses (requires Manage Messages permission)
 - **Customizable**: Trash emoji, bot status, and more
 
 ## Requirements
@@ -128,7 +133,7 @@ See `config.example.yml` for all available options.
 7. Under "Bot Permissions", select:
    - View Channels
    - Send Messages
-   - (Optional) Manage Webhooks - only if bot should create webhooks
+   - (Optional) Manage Webhooks - only needed if using `auto_create_webhooks: true`
 8. Generate the URL and invite the bot to your server
 9. Enable "Message Content Intent" in the Bot settings
 
@@ -173,26 +178,110 @@ cache:
 ### Persisting to File
 Enable file persistence to survive restarts:
 ```yaml
-cache:
-  persist_to_file: true
-  storage_file: "messages.dat"
+cache_persist: true
+cache_file: "messages.dat"
 ```
+
+### Bot Activity Status
+To change what the bot is "doing" in Discord:
+```yaml
+activity_type: "watching"    # Options: playing, streaming, listening, watching, custom
+activity_name: "for deleted messages"
+```
+To skip setting activity/presence entirely, set both to blank strings:
+```yaml
+activity_type: ""
+activity_name: ""
+```
+
+### Webhook Configuration
+By default, all undeleted messages go to the channel specified by `webhook_url`.
+
+**Option 1: Single webhook (simplest)**
+All undeleted messages go to one designated channel:
+```yaml
+webhook_url: "https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
+```
+Create one webhook in your desired channel (e.g., #undeleted-messages).
+
+**Option 2: Per-channel webhooks**
+Messages are undeleted to their original channel. You need a separate webhook for each channel:
+```yaml
+# Default fallback webhook
+webhook_url: "https://discord.com/api/webhooks/DEFAULT_ID/DEFAULT_TOKEN"
+
+# Per-channel webhooks - each must be in its respective channel
+channel_webhooks:
+  123456789012345678: "https://discord.com/api/webhooks/CHANNEL1_ID/TOKEN1"
+  876543210987654321: "https://discord.com/api/webhooks/CHANNEL2_ID/TOKEN2"
+```
+
+**Option 3: Auto-create webhooks (recommended)**
+With `Manage Webhooks` permission, the bot can automatically create webhooks for each channel as needed:
+```yaml
+webhook_url: "https://discord.com/api/webhooks/DEFAULT_ID/DEFAULT_TOKEN"  # Optional fallback
+auto_create_webhooks: true  # Bot will create webhooks automatically
+```
+**Note:** You need to create a separate webhook in Discord for each channel for Options 2 & 3.
+
+### Slash Commands
+
+The bot registers the following slash commands (only usable by users with Manage Messages permission):
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `/undelete toggle` or `/undelete off` | Temporarily disable the undeleter | Ephemeral confirmation (only you see it) |
+| `/undelete on` | Re-enable the undeleter | Ephemeral confirmation (only you see it) |
+| `/undelete status` | Check current status | Ephemeral response with current status |
+
+**Important:**
+- These are **slash commands** - start typing `/` in Discord to see them
+- Responses are **ephemeral** - only the command sender can see them
+- Only users with **Manage Messages** permission can use these commands
+- The toggle state is **NOT persisted** - it resets to ENABLED on bot restart
+- Messages deleted while the undeleter is disabled will NOT be reposted
+
+### Skipping Privileged User Messages
+To prevent messages from users with moderation permissions from being undeleted:
+```yaml
+# Skip users with manage_messages permission (DEFAULT)
+# This covers users who can delete messages (moderators, admins)
+skip_permissions: "manage_messages"
+```
+You can specify multiple permissions (comma-separated):
+```yaml
+# Skip users with any of these permissions
+skip_permissions: "administrator, manage_messages, kick, ban"
+```
+Or skip specific role IDs:
+```yaml
+skip_role_ids:
+  - 123456789012345678  # Admin role
+  - 876543210987654321  # Moderator role
+```
+**Note:** By default, all users with `manage_messages` permission are skipped. This includes both when they delete their own messages AND when they delete other users' messages (detected via their permissions).
 
 ### Channel Filtering
 Only monitor specific channels:
 ```yaml
-channels:
-  whitelist:
-    - 123456789012345678
-    - 876543210987654321
+channel_whitelist:
+  - 123456789012345678
+  - 876543210987654321
 ```
 
 Exclude specific channels:
 ```yaml
-channels:
-  blacklist:
-    - 111111111111111111
-    - 222222222222222222
+channel_blacklist:
+  - 111111111111111111
+  - 222222222222222222
+```
+
+You can also whitelist/blacklist entire servers (guilds):
+```yaml
+guild_whitelist:
+  - 123456789012345678
+guild_blacklist:
+  - 876543210987654321
 ```
 
 ## Troubleshooting

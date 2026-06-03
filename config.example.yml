@@ -6,23 +6,43 @@
 # Required Discord Permissions:
 # - View Channel (to see messages)
 # - Send Messages (to send via webhook)
+# - Manage Webhooks (ONLY if auto_create_webhooks is true)
 #
-# Optional: If you want the bot to create its own webhook,
-# it also needs: Manage Webhooks
+# Without Manage Webhooks permission:
+#   - You must manually create webhooks for each channel
+#   - Configure them in channel_webhooks below
+#
+# With Manage Webhooks permission:
+#   - Set auto_create_webhooks: true
+#   - Bot will automatically create webhooks as needed
 
 # Your Discord bot token from https://discord.com/developers/applications
 bot_token: "YOUR_BOT_TOKEN_HERE"
 
-# Webhook URL (get from Discord channel settings -> Integrations -> Webhooks)
+# Default webhook URL (fallback if no channel-specific webhook exists)
 # Format: https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
 webhook_url: "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
 
-# Trash emoji to prepend to undeleted messages
+# Auto-create webhooks for channels that don't have one
+# Requires Manage Webhooks permission
+# If false, you must manually configure channel_webhooks below
+auto_create_webhooks: false
+
+# Per-channel webhooks (optional)
+# Use this if you want messages undeleted to their original channel
+# Each webhook must be in the same channel as the channel_id
+# Format: CHANNEL_ID: WEBHOOK_URL
+channel_webhooks:
+  # 123456789012345678: "https://discord.com/api/webhooks/ID/TOKEN"
+  # 876543210987654321: "https://discord.com/api/webhooks/ID2/TOKEN2"
+
+# Trash emoji to prepend to webhook username
 # Common options: "🗑️", "🗓️", "🚮", "✅"
 trash_emoji: "🗑️"
 
 # Bot activity status (what the bot is "doing" in Discord)
 # Type: playing, streaming, listening, watching, custom
+# Set both to blank ("" or empty) to skip setting activity/presence
 activity_type: "watching"
 activity_name: "for deleted messages"
 
@@ -37,11 +57,26 @@ cache_persist: false
 # File to store persisted messages (only used if cache_persist is true)
 cache_file: "messages.dat"
 
+# Skip undeleting messages from privileged users
+# DEFAULT: Users with manage_messages permission are skipped
+# This includes both:
+#   - When a mod/admin deletes their own message
+#   - When a mod/admin deletes another user's message (detected via permissions)
+#
+# Options (comma-separated):
+#   administrator, admin, manage_messages, manage msg, kick, ban, manage_guild, manage server
+skip_permissions: "manage_messages"
+
+# Additionally skip users with specific role IDs
+# Useful if you have custom mod roles without standard permissions
+skip_role_ids:
+  # - 123456789012345678
+  # - 876543210987654321
+
 # Guild (server) specific settings
 # Blacklisted guild IDs (bot will ignore these servers)
 guild_blacklist:
   # - 123456789012345678
-  # - 876543210987654321
 
 # Whitelisted guild IDs (only these servers will be monitored, if non-empty)
 guild_whitelist:
@@ -55,4 +90,3 @@ channel_blacklist:
 # Whitelisted channel IDs (only these channels will be monitored, if non-empty)
 channel_whitelist:
   # - 123456789012345678
-  # - 876543210987654321
