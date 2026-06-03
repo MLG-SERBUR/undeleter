@@ -1,0 +1,58 @@
+# Undeleter Bot Configuration
+# ============================
+# This bot listens for deleted messages and reposts them via webhook
+# to preserve the message content.
+#
+# Required Discord Permissions:
+# - View Channel (to see messages)
+# - Send Messages (to send via webhook)
+#
+# Optional: If you want the bot to create its own webhook,
+# it also needs: Manage Webhooks
+
+# Your Discord bot token from https://discord.com/developers/applications
+bot_token: "YOUR_BOT_TOKEN_HERE"
+
+# Webhook URL (get from Discord channel settings -> Integrations -> Webhooks)
+# Format: https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
+webhook_url: "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+
+# Trash emoji to prepend to undeleted messages
+# Common options: "🗑️", "🗓️", "🚮", "✅"
+trash_emoji: "🗑️"
+
+# Bot activity status (what the bot is "doing" in Discord)
+# Type: playing, streaming, listening, watching, custom
+activity_type: "watching"
+activity_name: "for deleted messages"
+
+# Message cache settings
+# Maximum number of messages to keep in memory per channel
+# Reduce this for lower RAM usage (e.g., 100 for minimal RAM)
+cache_max_messages: 500
+
+# Persist messages to file (enable if bot restarts frequently)
+cache_persist: false
+
+# File to store persisted messages (only used if cache_persist is true)
+cache_file: "messages.dat"
+
+# Guild (server) specific settings
+# Blacklisted guild IDs (bot will ignore these servers)
+guild_blacklist:
+  # - 123456789012345678
+  # - 876543210987654321
+
+# Whitelisted guild IDs (only these servers will be monitored, if non-empty)
+guild_whitelist:
+  # - 123456789012345678
+
+# Channel specific settings
+# Blacklisted channel IDs (bot will ignore these channels)
+channel_blacklist:
+  # - 123456789012345678
+
+# Whitelisted channel IDs (only these channels will be monitored, if non-empty)
+channel_whitelist:
+  # - 123456789012345678
+  # - 876543210987654321
