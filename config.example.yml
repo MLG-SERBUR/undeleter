@@ -37,15 +37,16 @@ channel_webhooks:
   # 123456789012345678: "https://discord.com/api/webhooks/ID/TOKEN"
   # 876543210987654321: "https://discord.com/api/webhooks/ID2/TOKEN2"
 
+# Log permanently undeleted messages to a text file
+log_undeleted_to_file: true
+
+# File to store undelete logs (only used if log_undeleted_to_file is true)
+undelete_log_file: "undeleted.log"
+
 # Trash emoji to prepend to webhook username
 # Common options: "🗑️", "🗓️", "🚮", "✅"
 trash_emoji: "🗑️"
 
-# Bot activity status (what the bot is "doing" in Discord)
-# Type: playing, streaming, listening, watching, custom
-# Set both to blank ("" or empty) to skip setting activity/presence
-activity_type: ""
-activity_name: ""
 
 # Message cache settings
 # Maximum number of messages to keep in memory per channel
