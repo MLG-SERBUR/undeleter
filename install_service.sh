@@ -75,7 +75,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=$WORK_DIR
-ExecStart=$WORK_DIR/$EXEC_FILE
+ExecStart=$WORK_DIR/$EXEC_FILE $WORK_DIR/config.yml
 Restart=always
 RestartSec=10
 StandardOutput=journal

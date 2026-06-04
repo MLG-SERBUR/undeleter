@@ -23,6 +23,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <mutex>
+#include <optional>
 #include <ctime>
 #include <algorithm>
 #include <csignal>
@@ -34,8 +35,8 @@ struct Config {
     std::string bot_token;
     std::string webhook_url;  // Default webhook URL
     std::string trash_emoji = "🗑️";
-    int max_messages_per_channel = 500;
-    bool persist_to_file = false;
+    int max_messages_per_channel = 100;
+    bool persist_to_file = true;
     std::string storage_file = "messages.dat";
     std::vector<dpp::snowflake> guild_whitelist;
     std::vector<dpp::snowflake> guild_blacklist;
@@ -49,7 +50,7 @@ struct Config {
     // Default: skip users with manage_messages or administrator
     uint64_t skip_permissions = dpp::p_manage_messages;
     // Auto-create webhooks for channels that don't have one
-    bool auto_create_webhooks = false;
+    bool auto_create_webhooks = true;
 };
 
 // Cached message structure
@@ -70,6 +71,10 @@ Config config;
 // Message cache: channel_id -> vector of messages
 std::unordered_map<dpp::snowflake, std::vector<CachedMessage>> message_cache;
 std::mutex cache_mutex;
+
+// Cached webhook objects for channels, including auto-created webhooks
+std::unordered_map<dpp::snowflake, dpp::webhook> channel_webhook_objects;
+std::mutex webhook_mutex;
 
 // Get the cluster for webhook execution
 dpp::cluster* bot_cluster = nullptr;
@@ -174,7 +179,6 @@ bool load_config(const std::string& filename) {
 
     std::string line;
     std::string current_section;
-    std::string current_key;
     
     while (std::getline(file, line)) {
         line = ws_trim(line);
@@ -187,20 +191,13 @@ bool load_config(const std::string& filename) {
             size_t end_bracket = line.find(']');
             if (end_bracket != std::string::npos) {
                 current_section = line.substr(1, end_bracket - 1);
-                current_key.clear();
                 continue;
             }
         }
         
         // Check for YAML-style section (e.g., "webhook:" or "cache:")
         if (line.back() == ':') {
-            std::string section = ws_trim(line.substr(0, line.size() - 1));
-            // If we're in a section and encounter a sub-section, build the full key path
-            if (!current_section.empty()) {
-                current_key = current_section + "." + section;
-            } else {
-                current_section = section;
-            }
+            current_section = ws_trim(line.substr(0, line.size() - 1));
             continue;
         }
         
@@ -242,16 +239,7 @@ bool load_config(const std::string& filename) {
         std::string key = ws_trim(line.substr(0, colon_pos));
         std::string value = ws_trim(line.substr(colon_pos + 1));
         value = unquote(value);
-        
-        // Build full key path
-        std::string full_key;
-        if (!current_key.empty()) {
-            full_key = current_key + "." + key;
-        } else if (!current_section.empty()) {
-            full_key = current_section + "." + key;
-        } else {
-            full_key = key;
-        }
+        std::string full_key = key;
         
         // Process the key-value pair
         if (full_key == "bot_token" || full_key == "token") {
@@ -578,47 +566,107 @@ void remove_cached_message(dpp::snowflake message_id, dpp::snowflake channel_id)
 }
 
 /**
- * Extract webhook ID and token from URL
+ * Parse a webhook URL into a webhook object.
  */
-std::pair<std::string, std::string> parse_webhook_url(const std::string& url) {
+bool parse_webhook_url(const std::string& url, dpp::webhook& wh) {
     size_t api_pos = url.find("/api/webhooks/");
-    if (api_pos == std::string::npos) return {"", ""};
-    
+    if (api_pos == std::string::npos) {
+        return false;
+    }
+
     std::string rest = url.substr(api_pos + 15);
     size_t slash_pos = rest.find('/');
-    if (slash_pos == std::string::npos) return {"", ""};
-    
-    return {rest.substr(0, slash_pos), rest.substr(slash_pos + 1)};
+    if (slash_pos == std::string::npos) {
+        return false;
+    }
+
+    std::string webhook_id_str = rest.substr(0, slash_pos);
+    std::string token = rest.substr(slash_pos + 1);
+    if (webhook_id_str.empty() || token.empty()) {
+        return false;
+    }
+
+    try {
+        wh.id = std::stoull(webhook_id_str);
+        wh.token = token;
+        wh.url = url;
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 /**
- * Execute a webhook message
+ * Build a webhook URL from a webhook object.
  */
-void execute_webhook(const std::string& webhook_url, const dpp::message& wm) {
-    auto [webhook_id_str, token] = parse_webhook_url(webhook_url);
-    if (webhook_id_str.empty() || token.empty()) {
+std::string make_webhook_url(const dpp::webhook& wh) {
+    if (wh.id == 0 || wh.token.empty()) {
+        return "";
+    }
+    return "https://discord.com/api/webhooks/" + std::to_string(wh.id) + "/" + wh.token;
+}
+
+/**
+ * Cache webhook object for a channel.
+ */
+void cache_webhook_for_channel(dpp::snowflake channel_id, const dpp::webhook& wh) {
+    std::lock_guard<std::mutex> lock(webhook_mutex);
+    channel_webhook_objects[channel_id] = wh;
+    std::string webhook_url = make_webhook_url(wh);
+    if (!webhook_url.empty()) {
+        config.channel_webhooks[channel_id] = webhook_url;
+    }
+}
+
+/**
+ * Remove stale webhook cache entries for a channel.
+ */
+void clear_cached_webhook(dpp::snowflake channel_id) {
+    std::lock_guard<std::mutex> lock(webhook_mutex);
+    channel_webhook_objects.erase(channel_id);
+    config.channel_webhooks.erase(channel_id);
+}
+
+/**
+ * Retrieve a cached webhook object for a channel.
+ */
+std::optional<dpp::webhook> get_stored_webhook(dpp::snowflake channel_id) {
+    std::lock_guard<std::mutex> lock(webhook_mutex);
+    auto it = channel_webhook_objects.find(channel_id);
+    if (it != channel_webhook_objects.end()) {
+        return it->second;
+    }
+    auto it2 = config.channel_webhooks.find(channel_id);
+    if (it2 == config.channel_webhooks.end()) {
+        return std::nullopt;
+    }
+    dpp::webhook wh;
+    if (!parse_webhook_url(it2->second, wh)) {
+        return std::nullopt;
+    }
+    channel_webhook_objects[channel_id] = wh;
+    return wh;
+}
+
+/**
+ * Execute a webhook message.
+ */
+void execute_webhook(const dpp::webhook& wh, const dpp::message& wm, dpp::snowflake channel_id, dpp::snowflake guild_id, bool retry_on_unknown = true);
+
+
+/**
+ * Execute a webhook message given a webhook URL.
+ */
+void execute_webhook(const std::string& webhook_url, const dpp::message& wm, dpp::snowflake channel_id = 0, dpp::snowflake guild_id = 0) {
+    dpp::webhook wh;
+    if (!parse_webhook_url(webhook_url, wh)) {
         std::cerr << "Invalid webhook URL format: " << webhook_url << std::endl;
         return;
     }
-    
-    try {
-        dpp::snowflake webhook_id = std::stoull(webhook_id_str);
-        dpp::webhook wh;
-        wh.id = webhook_id;
-        wh.token = token;
-        
-        bot_cluster->execute_webhook(wh, wm, false, 0, "",
-            [](const dpp::confirmation_callback_t& completion) {
-                if (completion.is_error()) {
-                    std::cerr << "Webhook error: " << completion.get_error().message << std::endl;
-                } else {
-                    std::cout << "Successfully reposted deleted message via webhook" << std::endl;
-                }
-            }
-        );
-    } catch (const std::exception& e) {
-        std::cerr << "Error executing webhook: " << e.what() << std::endl;
+    if (channel_id != 0) {
+        cache_webhook_for_channel(channel_id, wh);
     }
+    execute_webhook(wh, wm, channel_id, guild_id);
 }
 
 /**
@@ -650,10 +698,7 @@ void create_webhook_for_channel(dpp::snowflake channel_id, dpp::snowflake guild_
         }
         
         dpp::webhook created_wh = response.get<dpp::webhook>();
-        std::string webhook_url = "https://discord.com/api/webhooks/" + 
-                                  std::to_string(created_wh.id) + "/" + created_wh.token;
-        
-        config.channel_webhooks[channel_id] = webhook_url;
+        cache_webhook_for_channel(channel_id, created_wh);
         std::cout << "Created webhook for channel " << channel_id << ": " << created_wh.id << std::endl;
         
         if (callback) {
@@ -663,11 +708,41 @@ void create_webhook_for_channel(dpp::snowflake channel_id, dpp::snowflake guild_
 }
 
 /**
+ * Execute a webhook message.
+ */
+void execute_webhook(const dpp::webhook& wh, const dpp::message& wm, dpp::snowflake channel_id, dpp::snowflake guild_id, bool retry_on_unknown) {
+    bot_cluster->execute_webhook(wh, wm, false, 0, "",
+        [channel_id, guild_id, wm, retry_on_unknown](const dpp::confirmation_callback_t& completion) {
+            if (completion.is_error()) {
+                std::string err = completion.get_error().message;
+                std::cerr << "Webhook error: " << err << std::endl;
+                if (err == "Unknown Webhook" && channel_id != 0) {
+                    clear_cached_webhook(channel_id);
+                    if (retry_on_unknown && config.auto_create_webhooks && guild_id != 0) {
+                        std::cerr << "Unknown webhook for channel " << channel_id << ", recreating and retrying..." << std::endl;
+                        create_webhook_for_channel(channel_id, guild_id, [wm, channel_id, guild_id](const dpp::webhook& new_wh) {
+                            execute_webhook(new_wh, wm, channel_id, guild_id, false);
+                        });
+                    }
+                }
+            } else {
+                std::cout << "Successfully reposted deleted message via webhook" << std::endl;
+            }
+        }
+    );
+}
+
+/**
  * Get or create a webhook for a channel
  */
 void get_or_create_webhook(dpp::snowflake channel_id, dpp::snowflake guild_id, 
                           const std::function<void(const std::string&)>& callback) {
     if (config.auto_create_webhooks && guild_id != 0) {
+        if (auto cached = get_stored_webhook(channel_id); cached) {
+            callback(make_webhook_url(*cached));
+            return;
+        }
+        
         auto it = config.channel_webhooks.find(channel_id);
         if (it != config.channel_webhooks.end()) {
             callback(it->second);
@@ -676,9 +751,7 @@ void get_or_create_webhook(dpp::snowflake channel_id, dpp::snowflake guild_id,
         
         create_webhook_for_channel(channel_id, guild_id, 
             [callback, channel_id](const dpp::webhook& wh) {
-                std::string webhook_url = "https://discord.com/api/webhooks/" + 
-                                          std::to_string(wh.id) + "/" + wh.token;
-                config.channel_webhooks[channel_id] = webhook_url;
+                std::string webhook_url = make_webhook_url(wh);
                 callback(webhook_url);
             }
         );
@@ -723,7 +796,7 @@ void repost_message(const CachedMessage& msg) {
             
             dpp::message wm;
             wm.content = config.trash_emoji + " **" + msg.author_name + "** deleted:\n" + msg.content;
-            execute_webhook(webhook_url, wm);
+            execute_webhook(webhook_url, wm, msg.channel_id, msg.guild_id);
         }
     );
 }
