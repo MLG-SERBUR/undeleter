@@ -2,19 +2,16 @@
  * Undeleter Bot for Discord
  * =========================
  * A lightweight C++ bot that reposts deleted messages via webhook.
- * 
- * Uses D++ library: https://github.com/brainboxdotcc/DPP
- * 
- * Features:
+ * * Uses D++ library: https://github.com/brainboxdotcc/DPP
+ * * Features:
  * - Caches messages in memory (configurable limit)
  * - Detects message deletions
  * - Reposts via webhook with original author name and trash emoji
- * - Optional message persistence to file
+ * - Message persistence to file for cache and permanent undelete logs
  * - Minimal RAM usage (C++)
  * - Minimal required permissions
  * - Ignores bulk deleted messages (admin purges/bans)
- * 
- * Required Discord Intents:
+ * * Required Discord Intents:
  * - GUILD_MESSAGES
  * - MESSAGE_CONTENT
  */
@@ -39,6 +36,11 @@ struct Config {
     int max_messages_per_channel = 100;
     bool persist_to_file = true;
     std::string storage_file = "messages.dat";
+    
+    // NEW: Persistent logging for undeleted messages
+    bool log_undeleted_to_file = true;
+    std::string undelete_log_file = "undeleted.log";
+    
     std::vector<dpp::snowflake> guild_whitelist;
     std::vector<dpp::snowflake> guild_blacklist;
     std::vector<dpp::snowflake> channel_blacklist;
@@ -134,12 +136,9 @@ std::string unquote(const std::string& str) {
  */
 std::vector<dpp::snowflake> parse_snowflake_list(const std::string& value) {
     std::vector<dpp::snowflake> result;
-    // Handle both comma-separated and YAML list format
     std::string trimmed = ws_trim(unquote(value));
     
-    // Check if it's a YAML list (starts with -)
     if (trimmed.find('-') != std::string::npos) {
-        // Parse YAML list format
         std::istringstream iss(trimmed);
         std::string line;
         while (std::getline(iss, line)) {
@@ -155,7 +154,6 @@ std::vector<dpp::snowflake> parse_snowflake_list(const std::string& value) {
             }
         }
     } else {
-        // Parse comma-separated format
         auto ids = split_string(trimmed, ',');
         for (auto& id : ids) {
             try {
@@ -183,11 +181,8 @@ bool load_config(const std::string& filename) {
     
     while (std::getline(file, line)) {
         line = ws_trim(line);
-        
-        // Skip comments and empty lines
         if (line.empty() || line[0] == '#') continue;
         
-        // Check for section (e.g., [webhook] or guilds:)
         if (line[0] == '[') {
             size_t end_bracket = line.find(']');
             if (end_bracket != std::string::npos) {
@@ -196,13 +191,11 @@ bool load_config(const std::string& filename) {
             }
         }
         
-        // Check for YAML-style section (e.g., "webhook:" or "cache:")
         if (line.back() == ':') {
             current_section = ws_trim(line.substr(0, line.size() - 1));
             continue;
         }
         
-        // Handle channel_webhooks map (special case)
         if (current_section == "channel_webhooks" && !line.empty() && line[0] != '#') {
             size_t colon_pos = line.find(':');
             if (colon_pos != std::string::npos) {
@@ -218,10 +211,8 @@ bool load_config(const std::string& filename) {
             continue;
         }
         
-        // Parse key-value pairs
         size_t colon_pos = line.find(':');
         if (colon_pos == std::string::npos) {
-            // Maybe a list item (starts with -)
             if (!line.empty() && line[0] == '-') {
                 std::string id = ws_trim(line.substr(1));
                 if (current_section == "guild_blacklist") {
@@ -242,7 +233,6 @@ bool load_config(const std::string& filename) {
         value = unquote(value);
         std::string full_key = key;
         
-        // Process the key-value pair
         if (full_key == "bot_token" || full_key == "token") {
             config.bot_token = value;
         } else if (full_key == "webhook_url") {
@@ -256,6 +246,10 @@ bool load_config(const std::string& filename) {
             config.persist_to_file = (value == "true" || value == "1" || value == "yes");
         } else if (full_key == "cache_file" || full_key == "cache.storage_file") {
             config.storage_file = value;
+        } else if (full_key == "log_undeleted_to_file" || full_key == "log_to_file") {
+            config.log_undeleted_to_file = (value == "true" || value == "1" || value == "yes");
+        } else if (full_key == "undelete_log_file" || full_key == "log_file") {
+            config.undelete_log_file = value;
         } else if (key == "channel_webhooks") {
             // Handled as section earlier
         } else if (key == "auto_create_webhooks") {
@@ -423,6 +417,30 @@ void save_messages_to_file() {
     } catch (const std::exception& e) {
         std::cerr << "Error saving messages to file: " << e.what() << std::endl;
     }
+}
+
+/**
+ * Log permanently undeleted messages to a text file
+ */
+void log_undeleted_message(const CachedMessage& msg) {
+    if (!config.log_undeleted_to_file) return;
+    
+    std::ofstream file(config.undelete_log_file, std::ios::app);
+    if (!file.is_open()) {
+        std::cerr << "Warning: Could not open undelete log file for writing." << std::endl;
+        return;
+    }
+    
+    char time_str[64];
+    std::tm* tm_info = std::localtime(&msg.timestamp);
+    std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    file << "[" << time_str << "]\n"
+         << "User:    " << msg.author_name << " (" << msg.author_id << ")\n"
+         << "Guild:   " << msg.guild_id << "\n"
+         << "Channel: " << msg.channel_id << "\n"
+         << "Content: " << msg.content << "\n"
+         << "--------------------------------------------------\n";
 }
 
 /**
@@ -797,6 +815,9 @@ void repost_message(const CachedMessage& msg) {
         return;
     }
     
+    // Log the deleted message to our permanent file cache
+    log_undeleted_message(msg);
+    
     get_or_create_webhook(msg.channel_id, msg.guild_id, 
         [msg](const std::string& webhook_url) {
             if (webhook_url.empty()) {
@@ -896,6 +917,7 @@ void on_message_delete(const dpp::message_delete_t& event) {
         std::cout << "Deleted message detected from " << cached->author_name 
                   << " in channel " << event.channel_id << ": " 
                   << cached->content << std::endl;
+                  
         repost_message(*cached);
         remove_cached_message(event.id, event.channel_id);
     } else {
@@ -964,6 +986,7 @@ int main(int argc, char** argv) {
     std::cout << "  Trash emoji: " << config.trash_emoji << std::endl;
     std::cout << "  Max messages per channel: " << config.max_messages_per_channel << std::endl;
     std::cout << "  Cache persistence: " << (config.persist_to_file ? "enabled" : "disabled") << std::endl;
+    std::cout << "  File logging for undeletes: " << (config.log_undeleted_to_file ? "enabled (" + config.undelete_log_file + ")" : "disabled") << std::endl;
     
     if (config.persist_to_file) {
         load_messages_from_file();
