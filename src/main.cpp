@@ -574,7 +574,7 @@ bool parse_webhook_url(const std::string& url, dpp::webhook& wh) {
         return false;
     }
 
-    std::string rest = url.substr(api_pos + 15);
+    std::string rest = url.substr(api_pos + 14);
     size_t slash_pos = rest.find('/');
     if (slash_pos == std::string::npos) {
         return false;
@@ -711,8 +711,18 @@ void create_webhook_for_channel(dpp::snowflake channel_id, dpp::snowflake guild_
  * Execute a webhook message.
  */
 void execute_webhook(const dpp::webhook& wh, const dpp::message& wm, dpp::snowflake channel_id, dpp::snowflake guild_id, bool retry_on_unknown) {
-    bot_cluster->execute_webhook(wh, wm, false, 0, "",
-        [channel_id, guild_id, wm, retry_on_unknown](const dpp::confirmation_callback_t& completion) {
+    dpp::json payload;
+    payload["content"] = wm.content;
+    if (!wh.name.empty()) {
+        payload["username"] = wh.name;
+    }
+    if (!wh.avatar_url.empty()) {
+        payload["avatar_url"] = wh.avatar_url;
+    }
+
+    bot_cluster->post_rest("/api/webhooks", std::to_string(wh.id), wh.token, dpp::m_post, payload.dump(),
+        [channel_id, guild_id, wm, retry_on_unknown](dpp::json &j, const dpp::http_request_completion_t& http) {
+            dpp::confirmation_callback_t completion(http);
             if (completion.is_error()) {
                 std::string err = completion.get_error().message;
                 std::cerr << "Webhook error: " << err << std::endl;
@@ -794,9 +804,16 @@ void repost_message(const CachedMessage& msg) {
                 return;
             }
             
+            dpp::webhook wh;
+            if (!parse_webhook_url(webhook_url, wh)) {
+                std::cerr << "Invalid webhook URL format: " << webhook_url << std::endl;
+                return;
+            }
+            wh.name = config.trash_emoji + msg.author_name;
+
             dpp::message wm;
-            wm.content = config.trash_emoji + " **" + msg.author_name + "** deleted:\n" + msg.content;
-            execute_webhook(webhook_url, wm, msg.channel_id, msg.guild_id);
+            wm.content = msg.content;
+            execute_webhook(wh, wm, msg.channel_id, msg.guild_id);
         }
     );
 }
