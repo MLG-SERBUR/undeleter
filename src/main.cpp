@@ -12,6 +12,7 @@
  * - Optional message persistence to file
  * - Minimal RAM usage (C++)
  * - Minimal required permissions
+ * - Ignores bulk deleted messages (admin purges/bans)
  * 
  * Required Discord Intents:
  * - GUILD_MESSAGES
@@ -907,26 +908,17 @@ void on_message_delete(const dpp::message_delete_t& event) {
  * Handle bulk message deletion
  */
 void on_message_delete_bulk(const dpp::message_delete_bulk_t& event) {
-    std::cout << "Bulk delete detected: " << event.deleted.size() << " messages." << std::endl;
+    std::cout << "Bulk delete detected: " << event.deleted.size() << " messages. Ignoring (admin action) and purging from cache." << std::endl;
     
-    std::vector<CachedMessage> to_repost;
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        for (auto msg_id : event.deleted) {
-            for (auto& [channel_id, messages] : message_cache) {
-                auto it = std::find_if(messages.begin(), messages.end(), [msg_id](const CachedMessage& msg) { return msg.id == msg_id; });
-                if (it != messages.end()) {
-                    to_repost.push_back(*it);
-                    messages.erase(it);
-                    break;
-                }
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    for (auto msg_id : event.deleted) {
+        for (auto& [channel_id, messages] : message_cache) {
+            auto it = std::find_if(messages.begin(), messages.end(), [msg_id](const CachedMessage& msg) { return msg.id == msg_id; });
+            if (it != messages.end()) {
+                // Erase from cache but intentionally skip reposting
+                messages.erase(it);
+                break;
             }
-        }
-    }
-    
-    for (const auto& msg : to_repost) {
-        if (is_channel_allowed(msg.channel_id, msg.guild_id)) {
-            repost_message(msg);
         }
     }
 }
