@@ -36,7 +36,23 @@ if [ ! -f "config.yml" ]; then
     exit 1
 fi
 
-# 3. Build the project
+# 3. Prepare Service variables
+SERVICE_NAME="undeleter"
+USER_NAME=$(whoami)
+WORK_DIR=$(pwd)
+EXEC_FILE="build/undeleter"
+
+# 4. Stop existing service before building
+# (Prevents "Text file busy" errors when deleting/overwriting the active binary)
+if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+    echo -e "${BLUE}Stopping existing user service for update...${NC}"
+    systemctl --user stop "$SERVICE_NAME"
+fi
+
+# 5. Build the project
+echo -e "${BLUE}Cleaning previous build...${NC}"
+rm -rf build/ # <--- Fully removes the old build folder so CMake builds completely from scratch
+
 echo -e "${BLUE}Building project with CMake...${NC}"
 mkdir -p build
 cd build
@@ -44,21 +60,15 @@ cmake ..
 make
 cd ..
 
-# Assuming the executable is named 'undeleter' in the build directory
-EXEC_FILE="build/undeleter"
+# 6. Verify successful build
 if [ ! -f "$EXEC_FILE" ]; then
     echo -e "${RED}Error: Executable not found at $EXEC_FILE after build.${NC}"
     exit 1
 fi
 
-# 4. Prepare Service variables
-SERVICE_NAME="undeleter"
-USER_NAME=$(whoami)
-WORK_DIR=$(pwd)
-
 echo -e "${BLUE}Configuring systemd service: $SERVICE_NAME...${NC}"
 
-# 5. Create the service file content
+# 7. Create the service file content
 SERVICE_CONTENT="[Unit]
 Description=Undeleter Service
 After=network.target
@@ -74,13 +84,7 @@ StandardError=journal
 [Install]
 WantedBy=default.target"
 
-# 6. Check if service is running and stop it for update (if exists)
-if systemctl --user is-active --quiet "$SERVICE_NAME"; then
-    echo -e "${BLUE}Stopping existing user service for update...${NC}"
-    systemctl --user stop "$SERVICE_NAME"
-fi
-
-# 7. Write to user systemd directory
+# 8. Write to user systemd directory
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 mkdir -p "$USER_SYSTEMD_DIR"
 
@@ -95,3 +99,4 @@ echo -e "${GREEN}=== Installation/Update Complete! ===${NC}"
 echo -e "You can view the logs with: ${BLUE}journalctl --user -u $SERVICE_NAME -f${NC}"
 echo -e "The service will now start automatically when you log in."
 echo -e "${BLUE}Note: To keep the service running after logout, run: sudo loginctl enable-linger $USER_NAME${NC}"
+echo -e "${RED}Important: Do not delete or move this folder, as the service runs directly from it.${NC}"

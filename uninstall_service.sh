@@ -12,18 +12,20 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 SERVICE_NAME="undeleter"
+SERVICE_FILE="$HOME/.config/systemd/user/$SERVICE_NAME.service"
 
 echo -e "${BLUE}=== Undeleter Uninstaller ===${NC}"
 
-# 1. Stop and disable the service
-if systemctl --user list-unit-files | grep -q "$SERVICE_NAME.service"; then
+# 1. Stop and disable the service (FIXED: Check file existence directly)
+if [ -f "$SERVICE_FILE" ]; then
     echo -e "${BLUE}Stopping and disabling service: $SERVICE_NAME...${NC}"
+    # FIXED: Added || true to disable so set -e doesn't break if already disabled
     systemctl --user stop "$SERVICE_NAME" || true
-    systemctl --user disable "$SERVICE_NAME"
+    systemctl --user disable "$SERVICE_NAME" || true
     
     # 2. Remove the service file
     echo -e "${BLUE}Removing service file...${NC}"
-    rm "$HOME/.config/systemd/user/$SERVICE_NAME.service"
+    rm "$SERVICE_FILE"
     
     # 3. Reload systemd
     systemctl --user daemon-reload
