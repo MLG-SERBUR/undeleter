@@ -688,7 +688,7 @@ void create_webhook_for_channel(dpp::snowflake channel_id, dpp::snowflake guild_
     
     dpp::webhook wh;
     wh.channel_id = channel_id;
-    wh.name = "Undeleter";
+    wh.name = "🗑️";
     
     bot_cluster->create_webhook(wh, [channel_id, callback](const dpp::confirmation_callback_t& response) {
         if (response.is_error()) {
