@@ -86,6 +86,10 @@ dpp::cluster* bot_cluster = nullptr;
 bool undelete_enabled = true;
 std::mutex undelete_mutex;
 
+// Track in-flight webhook requests to prevent duplicate creation races
+std::unordered_map<dpp::snowflake, std::vector<std::function<void(const std::string&)>>> pending_webhook_requests;
+std::mutex pending_mutex;
+
 /**
  * Split a string by delimiter
  */
@@ -704,7 +708,10 @@ std::string get_webhook_url(dpp::snowflake channel_id) {
  * Create a webhook for a channel
  */
 void create_webhook_for_channel(dpp::snowflake channel_id, dpp::snowflake guild_id, const std::function<void(const dpp::webhook&)>& callback) {
-    if (guild_id == 0) return;
+    if (guild_id == 0) {
+        if (callback) callback(dpp::webhook());
+        return;
+    }
     
     dpp::webhook wh;
     wh.channel_id = channel_id;
@@ -714,6 +721,7 @@ void create_webhook_for_channel(dpp::snowflake channel_id, dpp::snowflake guild_
         if (response.is_error()) {
             std::cerr << "Failed to create webhook for channel " << channel_id 
                       << ": " << response.get_error().message << std::endl;
+            if (callback) callback(dpp::webhook());
             return;
         }
         
@@ -774,8 +782,36 @@ void get_or_create_webhook(dpp::snowflake channel_id, dpp::snowflake guild_id,
             return;
         }
         
+        // Check for in-flight requests to prevent creation races
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex);
+            auto it = pending_webhook_requests.find(channel_id);
+            if (it != pending_webhook_requests.end()) {
+                it->second.push_back(callback);
+                return;
+            }
+            // Start a new pending request
+            pending_webhook_requests[channel_id] = {callback};
+        }
+
+        // Helper to resolve all pending requests for this channel
+        auto resolve_pending = [channel_id](const std::string& url) {
+            std::vector<std::function<void(const std::string&)>> callbacks;
+            {
+                std::lock_guard<std::mutex> lock(pending_mutex);
+                auto it = pending_webhook_requests.find(channel_id);
+                if (it != pending_webhook_requests.end()) {
+                    callbacks = std::move(it->second);
+                    pending_webhook_requests.erase(it);
+                }
+            }
+            for (const auto& cb : callbacks) {
+                if (cb) cb(url);
+            }
+        };
+
         // Search for existing webhook before creating a new one
-        bot_cluster->get_channel_webhooks(channel_id, [channel_id, guild_id, callback](const dpp::confirmation_callback_t& response) {
+        bot_cluster->get_channel_webhooks(channel_id, [channel_id, guild_id, resolve_pending](const dpp::confirmation_callback_t& response) {
             if (!response.is_error()) {
                 try {
                     dpp::webhook_map webhooks = std::get<dpp::webhook_map>(response.value);
@@ -784,7 +820,7 @@ void get_or_create_webhook(dpp::snowflake channel_id, dpp::snowflake guild_id,
                         if (wh.name == config.trash_emoji && !wh.token.empty()) {
                             std::cout << "Found existing webhook for channel " << channel_id << ": " << wh.id << std::endl;
                             cache_webhook_for_channel(channel_id, wh);
-                            callback(make_webhook_url(wh));
+                            resolve_pending(make_webhook_url(wh));
                             return;
                         }
                     }
@@ -795,9 +831,9 @@ void get_or_create_webhook(dpp::snowflake channel_id, dpp::snowflake guild_id,
             
             // If not found or error, create a new one
             create_webhook_for_channel(channel_id, guild_id, 
-                [callback, channel_id](const dpp::webhook& wh) {
+                [resolve_pending, channel_id](const dpp::webhook& wh) {
                     std::string webhook_url = make_webhook_url(wh);
-                    callback(webhook_url);
+                    resolve_pending(webhook_url);
                 }
             );
         });
