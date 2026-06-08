@@ -692,6 +692,7 @@ void execute_webhook(const std::string& webhook_url, const dpp::message& wm, dpp
  * Get the webhook URL for a specific channel
  */
 std::string get_webhook_url(dpp::snowflake channel_id) {
+    std::lock_guard<std::mutex> lock(webhook_mutex);
     auto it = config.channel_webhooks.find(channel_id);
     if (it != config.channel_webhooks.end()) {
         return it->second;
@@ -707,7 +708,7 @@ void create_webhook_for_channel(dpp::snowflake channel_id, dpp::snowflake guild_
     
     dpp::webhook wh;
     wh.channel_id = channel_id;
-    wh.name = "🗑️";
+    wh.name = config.trash_emoji;
     
     bot_cluster->create_webhook(wh, [channel_id, callback](const dpp::confirmation_callback_t& response) {
         if (response.is_error()) {
@@ -767,23 +768,39 @@ void execute_webhook(const dpp::webhook& wh, const dpp::message& wm, dpp::snowfl
 void get_or_create_webhook(dpp::snowflake channel_id, dpp::snowflake guild_id, 
                           const std::function<void(const std::string&)>& callback) {
     if (config.auto_create_webhooks && guild_id != 0) {
+        // This safely checks both in-memory cache AND config.channel_webhooks under a lock
         if (auto cached = get_stored_webhook(channel_id); cached) {
             callback(make_webhook_url(*cached));
             return;
         }
         
-        auto it = config.channel_webhooks.find(channel_id);
-        if (it != config.channel_webhooks.end()) {
-            callback(it->second);
-            return;
-        }
-        
-        create_webhook_for_channel(channel_id, guild_id, 
-            [callback, channel_id](const dpp::webhook& wh) {
-                std::string webhook_url = make_webhook_url(wh);
-                callback(webhook_url);
+        // Search for existing webhook before creating a new one
+        bot_cluster->get_channel_webhooks(channel_id, [channel_id, guild_id, callback](const dpp::confirmation_callback_t& response) {
+            if (!response.is_error()) {
+                try {
+                    dpp::webhook_map webhooks = std::get<dpp::webhook_map>(response.value);
+                    for (auto const& [id, wh] : webhooks) {
+                        // FIX: Ensure the webhook actually belongs to us / has a token
+                        if (wh.name == config.trash_emoji && !wh.token.empty()) {
+                            std::cout << "Found existing webhook for channel " << channel_id << ": " << wh.id << std::endl;
+                            cache_webhook_for_channel(channel_id, wh);
+                            callback(make_webhook_url(wh));
+                            return;
+                        }
+                    }
+                } catch (...) {
+                    // Handle case where variant doesn't contain webhook_map
+                }
             }
-        );
+            
+            // If not found or error, create a new one
+            create_webhook_for_channel(channel_id, guild_id, 
+                [callback, channel_id](const dpp::webhook& wh) {
+                    std::string webhook_url = make_webhook_url(wh);
+                    callback(webhook_url);
+                }
+            );
+        });
         return;
     }
     
