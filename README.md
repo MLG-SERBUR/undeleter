@@ -235,9 +235,12 @@ The bot registers the following slash commands (only usable by users with Manage
 
 | Command | Description | Response |
 |---------|-------------|----------|
-| `/undelete toggle` or `/undelete off` | Temporarily disable the undeleter | Ephemeral confirmation (only you see it) |
-| `/undelete on` | Re-enable the undeleter | Ephemeral confirmation (only you see it) |
-| `/undelete status` | Check current status | Ephemeral response with current status |
+| `/undelete toggle` or `/undelete off` | Temporarily disable the undeleter | Ephemeral confirmation |
+| `/undelete on` | Re-enable the undeleter | Ephemeral confirmation |
+| `/undelete status` | Check current status | Ephemeral response |
+
+## Moderator Actions
+The bot automatically detects when a moderator deletes a message by monitoring Discord audit logs. Using a smart accounting system, it tracks deletion counts to ensure that moderator-initiated deletions (including rapid or bulk deletions) are correctly identified and skipped by the undeleter.
 
 **Important:**
 - These are **slash commands** - start typing `/` in Discord to see them

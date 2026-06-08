@@ -90,6 +90,27 @@ std::mutex undelete_mutex;
 std::unordered_map<dpp::snowflake, std::vector<std::function<void(const std::string&)>>> pending_webhook_requests;
 std::mutex pending_mutex;
 
+// Audit log heuristics
+struct ModDeletionKey {
+    dpp::snowflake guild_id;
+    dpp::snowflake channel_id;
+    dpp::snowflake author_id;
+
+    bool operator==(const ModDeletionKey& other) const {
+        return guild_id == other.guild_id && channel_id == other.channel_id && author_id == other.author_id;
+    }
+};
+
+struct ModDeletionKeyHash {
+    size_t operator()(const ModDeletionKey& k) const {
+        return std::hash<uint64_t>{}(k.guild_id) ^ std::hash<uint64_t>{}(k.channel_id) ^ std::hash<uint64_t>{}(k.author_id);
+    }
+};
+
+std::unordered_map<dpp::snowflake, uint32_t> known_audit_counts;
+std::unordered_map<ModDeletionKey, uint32_t, ModDeletionKeyHash> pending_mod_deletions;
+std::mutex audit_mutex;
+
 /**
  * Split a string by delimiter
  */
@@ -894,10 +915,12 @@ void repost_message(const CachedMessage& msg) {
 }
 
 /**
- * Handle slash command for toggling undeleter
+ * Handle slash command for toggling undeleter and manual deletion
  */
 void on_slashcommand(const dpp::slashcommand_t& event) {
-    if (event.command.get_command_name() == "undelete") {
+    std::string cmd_name = event.command.get_command_name();
+    
+    if (cmd_name == "undelete") {
         dpp::permission perms = event.command.get_resolved_permission(event.command.usr.id);
         if (!perms.can(dpp::p_manage_messages) && !perms.can(dpp::p_administrator)) {
             event.reply(dpp::message("❌ You do not have permission to use this command. (Require Manage Messages permission)").set_flags(dpp::m_ephemeral));
@@ -929,6 +952,7 @@ void on_slashcommand(const dpp::slashcommand_t& event) {
  * Register slash commands
  */
 void register_commands(dpp::cluster& bot) {
+    // 1. /undelete command
     dpp::slashcommand cmd;
     cmd.set_name("undelete");
     cmd.set_description("Manage the undeleter bot");
@@ -965,13 +989,78 @@ void on_message_delete(const dpp::message_delete_t& event) {
     CachedMessage* cached = find_cached_message(event.id, event.channel_id);
     if (cached) {
         if (!is_channel_allowed(event.channel_id, cached->guild_id)) {
+            remove_cached_message(event.id, event.channel_id);
             return;
         }
+
+        if (cached->skip_undelete) {
+            std::cout << "Message " << event.id << " marked for skip (mod action), removing from cache.\n";
+            remove_cached_message(event.id, event.channel_id);
+            return;
+        }
+
         std::cout << "Deleted message detected from " << cached->author_name 
                   << " in channel " << event.channel_id << ": " 
                   << cached->content << std::endl;
                   
-        repost_message(*cached);
+        // Delay by 2 seconds to allow audit log to update
+        bot_cluster->start_timer([msg = *cached](dpp::timer timer) {
+            bot_cluster->stop_timer(timer);
+            
+            bot_cluster->guild_auditlog_get(
+                msg.guild_id, 0, dpp::aut_message_delete, 0, 0, 5,
+                [msg](const dpp::confirmation_callback_t& response) {
+                    bool is_mod_deletion = false;
+                    ModDeletionKey key{msg.guild_id, msg.channel_id, msg.author_id};
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(audit_mutex);
+                        
+                        if (!response.is_error()) {
+                            dpp::auditlog log = std::get<dpp::auditlog>(response.value);
+                            for (auto& entry : log.entries) {
+                                if (entry.type == dpp::aut_message_delete &&
+                                    entry.target_id == msg.author_id &&
+                                    entry.extra.has_value() &&
+                                    entry.extra->channel_id == msg.channel_id) {
+                                    
+                                    uint32_t current_count = 1;
+                                    if (!entry.extra->count.empty()) {
+                                        try { current_count = std::stoul(entry.extra->count); } catch(...) {}
+                                    }
+                                    
+                                    auto it = known_audit_counts.find(entry.id);
+                                    if (it == known_audit_counts.end()) {
+                                        // First time seeing this entry. If it's new (created in last 60s), 
+                                        // treat as a mod deletion.
+                                        if (entry.id.get_creation_time() > time(nullptr) - 60) {
+                                            pending_mod_deletions[key] += current_count;
+                                        }
+                                        known_audit_counts[entry.id] = current_count;
+                                    } else if (current_count > it->second) {
+                                        pending_mod_deletions[key] += (current_count - it->second);
+                                        known_audit_counts[entry.id] = current_count;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if (pending_mod_deletions[key] > 0) {
+                            pending_mod_deletions[key]--;
+                            is_mod_deletion = true;
+                        }
+                    }
+
+                    if (!is_mod_deletion) {
+                        repost_message(msg);
+                    } else {
+                        std::cout << "Mod deletion detected (accounted) for message " << msg.id << " by " << msg.author_name << ", skipping undelete.\n";
+                    }
+                }
+            );
+        }, 2);
+        
         remove_cached_message(event.id, event.channel_id);
     } else {
         std::cout << "Message deleted but not in cache: " << event.id 
